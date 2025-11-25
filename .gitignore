@@ -155,3 +155,5 @@ projects/configs/gemap/debug.py
 projects/configs/gemap/debug_lidar.py
 projects/configs/gemap/try.py
 .dist_test/
+*.png
+*.json
