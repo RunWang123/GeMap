@@ -157,3 +157,4 @@ projects/configs/gemap/try.py
 .dist_test/
 *.png
 *.json
+output/

@@ -386,7 +386,7 @@ class VectorizedLocalMap(object):
                  nusc_map,
                  map_explorer,
                  patch_size,
-                 map_classes=['divider','ped_crossing','boundary','centerline'],
+                 map_classes=['divider','ped_crossing','boundary'],  # Removed 'centerline' to avoid graph error
                  line_classes=['road_divider', 'lane_divider'],
                  ped_crossing_classes=['ped_crossing'],
                  contour_classes=['road_segment', 'lane'],
@@ -757,7 +757,7 @@ def create_nuscenes_infos(root_path,
                           out_path,
                           can_bus_root_path,
                           info_prefix,
-                          version='v1.0-trainval',
+                          version='v1.0-mini',
                           max_sweeps=10):
     """Create info file of nuscene dataset.
 
@@ -924,7 +924,7 @@ args = parser.parse_args()
 
 
 if __name__ == '__main__':
-    train_version = f'{args.version}-trainval'
+    train_version = f'{args.version}'
     nuscenes_data_prep(
         root_path=args.root_path,
         can_bus_root_path=args.canbus,
