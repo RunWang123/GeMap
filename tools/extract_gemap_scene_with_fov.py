@@ -125,9 +125,9 @@ def run_inference_with_fov_clipping(
     """
     scene = nusc.scene[scene_idx]
     scene_token = scene['token']
-    scene_name = scene['name']
+    scene_name = f"scene-{scene_token[:4]}"  # Use token like gamma script
     
-    print(f"\nProcessing scene {scene_idx}: {scene_name}")
+    print(f"\nProcessing scene {scene_idx}: {scene_name} (token: {scene_token})")
     print(f"  Cameras: {', '.join(camera_names)}")
     
     # Get all samples in scene
@@ -485,6 +485,8 @@ def main():
     parser.add_argument('--nuscenes_path', type=str, required=True)
     parser.add_argument('--version', type=str, default='v1.0-mini',
                        choices=['v1.0-trainval', 'v1.0-test', 'v1.0-mini'])
+    parser.add_argument('--split', type=str, default='val', choices=['train', 'val', None],
+                       help='Filter scenes by split (train/val). Default is val. If None, process all scenes.')
     parser.add_argument('--scene_idx', type=int, help='Specific scene index')
     parser.add_argument('--num_scenes', type=int, help='Number of scenes to process')
     parser.add_argument('--output_dir', type=str, required=True)
@@ -511,19 +513,49 @@ def main():
     nusc = NuScenes(version=args.version, dataroot=args.nuscenes_path, verbose=False)
     print(f"Loaded {len(nusc.scene)} scenes")
     
+    # Filter scenes by split if specified
+    if args.split is not None:
+        # Load split from pickle files (same as gamma script uses)
+        import pickle
+        pkl_file = os.path.join(args.nuscenes_path, f'nuscenes_infos_temporal_{args.split}.pkl')
+        if os.path.exists(pkl_file):
+            print(f"Loading split from: {pkl_file}")
+            with open(pkl_file, 'rb') as f:
+                pkl_data = pickle.load(f)
+            # Extract scene tokens from pickle file
+            split_scene_tokens = set()
+            for sample_info in pkl_data['infos']:
+                split_scene_tokens.add(sample_info['scene_token'])
+            # Get indices of scenes in the requested split
+            filtered_indices = []
+            for i in range(len(nusc.scene)):
+                if nusc.scene[i]['token'] in split_scene_tokens:
+                    filtered_indices.append(i)
+            print(f"Filtered to {len(filtered_indices)} scenes in '{args.split}' split (from pickle file)")
+        else:
+            print(f"Warning: Pickle file not found: {pkl_file}")
+            print(f"Falling back to nuScenes official split")
+            from nuscenes.utils import splits
+            split_scenes = splits.create_splits_scenes()[args.split]
+            all_scene_names = [nusc.scene[i]['name'] for i in range(len(nusc.scene))]
+            filtered_indices = [i for i, name in enumerate(all_scene_names) if name in split_scenes]
+            print(f"Filtered to {len(filtered_indices)} scenes in '{args.split}' split")
+    else:
+        filtered_indices = list(range(len(nusc.scene)))
+    
     # Determine scenes to process
     if args.scene_idx is not None:
         scene_indices = [args.scene_idx]
     elif args.num_scenes is not None:
-        scene_indices = list(range(min(args.num_scenes, len(nusc.scene))))
+        scene_indices = filtered_indices[:args.num_scenes]
     else:
-        scene_indices = list(range(len(nusc.scene)))
+        scene_indices = filtered_indices
         print(f"Processing all {len(scene_indices)} scenes")
     
     # Process each scene
-    for scene_idx in scene_indices:
+    for local_idx, scene_idx in enumerate(scene_indices):
         print(f"\n{'='*80}")
-        print(f"Processing scene {scene_idx}/{len(nusc.scene)-1}")
+        print(f"Processing scene {local_idx}/{len(scene_indices)-1} (global idx: {scene_idx})")
         print(f"{'='*80}")
         
         # Run inference with FOV clipping
@@ -541,10 +573,10 @@ def main():
             print(f"  Skipping scene {scene_idx} - no predictions after FOV clipping")
             continue
         
-        # Create scene output directory
+        # Create scene output directory (use local index for sequential numbering)
         scene_name = pred_data['scene_name']
         camera_suffix = '_'.join(camera_names)
-        scene_output_dir = output_dir / f"scene_{scene_idx:04d}_{scene_name}_{camera_suffix}"
+        scene_output_dir = output_dir / f"scene_{local_idx:04d}_{scene_name}_{camera_suffix}"
         scene_output_dir.mkdir(exist_ok=True)
         
         # Save predictions
