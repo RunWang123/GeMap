@@ -158,3 +158,4 @@ projects/configs/gemap/try.py
 *.png
 *.json
 output/
+*.pkl
