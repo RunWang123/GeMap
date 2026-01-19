@@ -56,9 +56,14 @@ import os.path as osp
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
 from shapely.geometry import LineString, Point, box as shapely_box
 from shapely.affinity import affine_transform, rotate
-import cv2
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+# Import shared camera FOV utilities
+from camera_fov_utils import (
+    VectorizedLocalMap,
+    CameraFOVClipper,
+    extract_gt_vectors,
+    extract_gt_with_fov_clipping,
+    process_predictions_with_fov_clipping
+)
 
 # Add GeMap project path
 project_root = Path(__file__).parent.parent
@@ -292,26 +297,37 @@ class RasterMapEvaluator:
     """
     Evaluator for rasterized map using mIoU metric.
     Based on StreamMapNet's raster_eval.py approach.
+    Uses EXACT same FOV clipping as gemap_eval_unified.py.
     
     Args:
+        nuscenes_data_path: Path to NuScenes dataset
         pc_range: Point cloud range [x_min, y_min, z_min, x_max, y_max, z_max]
         canvas_size: Size of rasterized map (width, height) in pixels
         line_width: Width of rendered lines in meters (for rasterization)
         class_names: List of class names
+        camera_names: List of camera names for evaluation
+        apply_clipping: Whether to apply camera FOV clipping
     """
     
     def __init__(
         self,
+        nuscenes_data_path: str,
         pc_range: List[float] = [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0],
         canvas_size: Tuple[int, int] = (200, 400),  # (width, height) in pixels
         line_width: float = 2.0,  # meters
-        class_names: List[str] = ['divider', 'ped_crossing', 'boundary']
+        class_names: List[str] = ['divider', 'ped_crossing', 'boundary'],
+        camera_names: List[str] = None,
+        apply_clipping: bool = True
     ):
+        self.nuscenes_data_path = nuscenes_data_path
+        self.nuscenes_data_path = nuscenes_data_path
         self.pc_range = pc_range
         self.canvas_size = canvas_size  # (width, height)
         self.line_width = line_width
         self.class_names = class_names
         self.num_classes = len(class_names)
+        self.camera_names = camera_names or ['CAM_FRONT']
+        self.apply_clipping = apply_clipping
         
         # Compute resolution (meters per pixel)
         self.x_range = pc_range[3] - pc_range[0]  # 30m
@@ -319,17 +335,20 @@ class RasterMapEvaluator:
         self.x_resolution = self.x_range / canvas_size[0]  # meters per pixel
         self.y_resolution = self.y_range / canvas_size[1]  # meters per pixel
         
-        # Storage for predictions and ground truths (rasterized)
-        self.pred_masks = {}  # token -> [num_classes, H, W]
-        self.gt_masks = {}    # token -> [num_classes, H, W]
+        # Storage for predictions and ground truths (rasterized) per camera
+        self.pred_masks = {cam: {} for cam in self.camera_names}  # camera -> {token -> [num_classes, H, W]}
+        self.gt_masks = {cam: {} for cam in self.camera_names}    # camera -> {token -> [num_classes, H, W]}
         
         print(f"\nRasterMapEvaluator initialized:")
+        print(f"  NuScenes path: {nuscenes_data_path}")
         print(f"  PC range: {pc_range}")
         print(f"  Canvas size: {canvas_size} (W x H)")
         print(f"  X resolution: {self.x_resolution:.3f} m/pixel")
         print(f"  Y resolution: {self.y_resolution:.3f} m/pixel")
         print(f"  Line width: {line_width} meters")
         print(f"  Classes: {class_names}")
+        print(f"  Cameras: {self.camera_names}")
+        print(f"  FOV clipping: {'ENABLED' if apply_clipping else 'DISABLED (full BEV)'}")
     
     def ego_to_pixel(self, points: np.ndarray) -> np.ndarray:
         """
@@ -417,8 +436,7 @@ class RasterMapEvaluator:
         self,
         sample_token: str,
         output_dir: str,
-        pred_vectors: np.ndarray = None,
-        pred_labels: np.ndarray = None
+        camera_name: str = 'CAM_FRONT'
     ):
         """
         Visualize GT and predictions for a sample.
@@ -426,14 +444,13 @@ class RasterMapEvaluator:
         Args:
             sample_token: Sample token
             output_dir: Directory to save visualization
-            pred_vectors: Predicted vectors (optional)
-            pred_labels: Predicted labels (optional)
+            camera_name: Camera name for which data to visualize
         """
         os.makedirs(output_dir, exist_ok=True)
         
-        # Get GT and pred masks
-        gt_mask = self.gt_masks.get(sample_token)
-        pred_mask = self.pred_masks.get(sample_token)
+        # Get GT and pred masks for this camera
+        gt_mask = self.gt_masks[camera_name].get(sample_token)
+        pred_mask = self.pred_masks[camera_name].get(sample_token)
         
         if gt_mask is None:
             print(f"Warning: No GT for sample {sample_token}")
@@ -524,31 +541,30 @@ class RasterMapEvaluator:
     def load_gt_vectors(
         self, 
         sample_info: Dict, 
-        nuscenes_path: str,
+        camera_name: str,
         fixed_num: int = 20
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Load ground truth vectors from NuScenes for a sample.
-        Uses EXACT same extraction method as visualization script.
+        Load ground truth vectors from NuScenes for a sample with FOV clipping.
+        Uses EXACT same extraction method as gemap_eval_unified.py.
         
         Args:
             sample_info: Sample information dictionary
-            nuscenes_path: Path to NuScenes dataset
+            camera_name: Camera name for FOV clipping
             fixed_num: Number of points to resample to (default: 20)
         
         Returns:
             gt_vectors: [N, num_pts, 2] array
             gt_labels: [N] array
         """
-        # Import shared utilities
-        from camera_fov_utils import extract_gt_vectors
-        
-        # Extract GT using same method as visualization
-        gt_data = extract_gt_vectors(
+        # Extract GT using same method as gemap_eval_unified.py
+        gt_data = extract_gt_with_fov_clipping(
             sample_info=sample_info,
-            nuscenes_path=nuscenes_path,
+            nuscenes_path=self.nuscenes_data_path,
             pc_range=self.pc_range,
-            fixed_num=fixed_num
+            camera_name=camera_name,
+            fixed_num=fixed_num,
+            apply_clipping=self.apply_clipping
         )
         
         gt_vectors = gt_data['vectors']  # List of numpy arrays
@@ -563,17 +579,67 @@ class RasterMapEvaluator:
         
         return gt_vectors, gt_labels
     
+    def process_predictions_with_fov(
+        self,
+        pred_vectors: np.ndarray,
+        pred_labels: np.ndarray,
+        pred_scores: np.ndarray,
+        sample_info: Dict,
+        camera_name: str
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Process predictions with optional FOV clipping and rotation.
+        Uses EXACT same method as gemap_eval_unified.py.
+        
+        Args:
+            pred_vectors: [N, num_pts, 2] predicted vectors
+            pred_labels: [N] predicted labels
+            pred_scores: [N] predicted scores
+            sample_info: Sample information dictionary
+            camera_name: Camera name for FOV clipping
+        
+        Returns:
+            Processed vectors, labels, scores
+        """
+        if len(pred_vectors) == 0:
+            return np.array([]), np.array([]), np.array([])
+        
+        # Use shared function from camera_fov_utils.py
+        vectors, labels, scores = process_predictions_with_fov_clipping(
+            pred_vectors=pred_vectors,
+            pred_labels=pred_labels,
+            pred_scores=pred_scores,
+            sample_info=sample_info,
+            nuscenes_path=self.nuscenes_data_path,
+            pc_range=self.pc_range,
+            camera_name=camera_name,
+            apply_clipping=self.apply_clipping
+        )
+        
+        if len(vectors) == 0:
+            return np.array([]), np.array([]), np.array([])
+        
+        # Convert list to array if needed
+        if isinstance(vectors, list):
+            vectors = np.array(vectors)
+        if isinstance(labels, list):
+            labels = np.array(labels)
+        if isinstance(scores, list):
+            scores = np.array(scores)
+        
+        return vectors, labels, scores
+    
     def accumulate_sample(
         self,
         sample_token: str,
         sample_info: Dict,
         pred_vectors: np.ndarray,
         pred_labels: np.ndarray,
-        pred_scores: np.ndarray = None,
-        nuscenes_path: str = None
+        pred_scores: np.ndarray = None
     ):
         """
-        Rasterize and accumulate a single sample.
+        Rasterize and accumulate a single sample for all cameras.
+        Uses EXACT same FOV clipping as gemap_eval_unified.py.
         
         Args:
             sample_token: NuScenes sample token
@@ -581,104 +647,148 @@ class RasterMapEvaluator:
             pred_vectors: [N, num_pts, 2] predicted vectors
             pred_labels: [N] predicted labels
             pred_scores: [N] prediction scores (optional, for thresholding)
-            nuscenes_path: Path to NuScenes dataset (required for GT extraction)
         """
-        # Rasterize predictions
-        pred_mask = self.rasterize_sample(pred_vectors, pred_labels)
-        self.pred_masks[sample_token] = pred_mask
-        
-        # Load and rasterize ground truth
-        gt_vectors, gt_labels = self.load_gt_vectors(sample_info, nuscenes_path)
-        gt_mask = self.rasterize_sample(gt_vectors, gt_labels)
-        self.gt_masks[sample_token] = gt_mask
+        # Process for each camera
+        for camera_name in self.camera_names:
+            # Process predictions with FOV clipping
+            pred_vectors_clipped, pred_labels_clipped, pred_scores_clipped = \
+                self.process_predictions_with_fov(
+                    pred_vectors, pred_labels, pred_scores,
+                    sample_info, camera_name
+                )
+            
+            # Rasterize predictions
+            pred_mask = self.rasterize_sample(pred_vectors_clipped, pred_labels_clipped)
+            self.pred_masks[camera_name][sample_token] = pred_mask
+            
+            # Load and rasterize ground truth with FOV clipping
+            gt_vectors, gt_labels = self.load_gt_vectors(sample_info, camera_name)
+            gt_mask = self.rasterize_sample(gt_vectors, gt_labels)
+            self.gt_masks[camera_name][sample_token] = gt_mask
     
-    def compute_iou_per_class(self) -> Dict[str, float]:
+    def compute_iou_per_class(self) -> Dict[str, Dict[str, float]]:
         """
-        Compute IoU for each class across all samples.
+        Compute IoU for each class and camera across all samples.
         
         Returns:
-            Dictionary with IoU per class and mIoU
+            Dictionary with IoU per camera and class, plus mIoU
         """
-        # Stack all predictions and ground truths
-        pred_masks_list = []
-        gt_masks_list = []
-        
-        for token in self.gt_masks.keys():
-            if token in self.pred_masks:
-                pred_masks_list.append(self.pred_masks[token])
-                gt_masks_list.append(self.gt_masks[token])
-        
-        if len(pred_masks_list) == 0:
-            return {name: 0.0 for name in self.class_names}
-        
-        # Stack to [N, num_classes, H, W]
-        preds = np.stack(pred_masks_list, axis=0)
-        gts = np.stack(gt_masks_list, axis=0)
-        
         results = {}
-        total_iou = 0.0
         
-        # Compute IoU for each class
-        for class_id, class_name in enumerate(self.class_names):
-            pred = preds[:, class_id]
-            gt = gts[:, class_id]
+        for camera_name in self.camera_names:
+            # Stack all predictions and ground truths for this camera
+            pred_masks_list = []
+            gt_masks_list = []
             
-            # Compute intersection and union
-            intersect = (pred & gt).sum()
-            union = (pred | gt).sum()
+            for token in self.gt_masks[camera_name].keys():
+                if token in self.pred_masks[camera_name]:
+                    pred_masks_list.append(self.pred_masks[camera_name][token])
+                    gt_masks_list.append(self.gt_masks[camera_name][token])
             
-            # IoU
-            iou = float(intersect) / (float(union) + 1e-7)
-            results[class_name] = iou
-            total_iou += iou
+            if len(pred_masks_list) == 0:
+                results[camera_name] = {name: 0.0 for name in self.class_names}
+                results[camera_name]['mIoU'] = 0.0
+                continue
+            
+            # Stack to [N, num_classes, H, W]
+            preds = np.stack(pred_masks_list, axis=0)
+            gts = np.stack(gt_masks_list, axis=0)
+            
+            camera_results = {}
+            total_iou = 0.0
+            
+            # Compute IoU for each class
+            for class_id, class_name in enumerate(self.class_names):
+                pred = preds[:, class_id]
+                gt = gts[:, class_id]
+                
+                # Compute intersection and union
+                intersect = (pred & gt).sum()
+                union = (pred | gt).sum()
+                
+                # IoU
+                iou = float(intersect) / (float(union) + 1e-7)
+                camera_results[class_name] = iou
+                total_iou += iou
+            
+            # mIoU
+            camera_results['mIoU'] = total_iou / self.num_classes
+            results[camera_name] = camera_results
         
-        # mIoU
-        results['mIoU'] = total_iou / self.num_classes
+        # Compute average across cameras if multiple
+        if len(self.camera_names) > 1:
+            avg_results = {}
+            for class_name in self.class_names:
+                ious = [results[cam][class_name] for cam in self.camera_names]
+                avg_results[class_name] = np.mean(ious)
+            avg_results['mIoU'] = np.mean([results[cam]['mIoU'] for cam in self.camera_names])
+            results['AVERAGE'] = avg_results
         
         return results
     
-    def evaluate(self) -> Dict[str, float]:
+    def evaluate(self) -> Dict[str, Dict[str, float]]:
         """
         Run evaluation and return results.
         
         Returns:
-            Dictionary with IoU per class and mIoU
+            Dictionary with IoU per camera, class and mIoU
         """
-        print(f"\nEvaluating on {len(self.gt_masks)} samples...")
+        total_samples = sum(len(self.gt_masks[cam]) for cam in self.camera_names)
+        print(f"\nEvaluating on {total_samples} samples across {len(self.camera_names)} camera(s)...")
         
         # Print statistics before computing IoU
-        total_gt_pixels = 0
-        total_pred_pixels = 0
-        for token in self.gt_masks.keys():
-            if token in self.pred_masks:
-                gt_mask = self.gt_masks[token]
-                pred_mask = self.pred_masks[token]
-                total_gt_pixels += gt_mask.sum()
-                total_pred_pixels += pred_mask.sum()
-        
-        print(f"  Total GT pixels: {total_gt_pixels}")
-        print(f"  Total Pred pixels: {total_pred_pixels}")
+        for camera_name in self.camera_names:
+            total_gt_pixels = 0
+            total_pred_pixels = 0
+            for token in self.gt_masks[camera_name].keys():
+                if token in self.pred_masks[camera_name]:
+                    gt_mask = self.gt_masks[camera_name][token]
+                    pred_mask = self.pred_masks[camera_name][token]
+                    total_gt_pixels += gt_mask.sum()
+                    total_pred_pixels += pred_mask.sum()
+            
+            print(f"  {camera_name}: GT pixels: {total_gt_pixels}, Pred pixels: {total_pred_pixels}")
         
         results = self.compute_iou_per_class()
         return results
     
-    def print_results(self, results: Dict[str, float]):
+    def print_results(self, results: Dict[str, Dict[str, float]]):
         """
         Pretty print evaluation results.
         
         Args:
-            results: Dictionary with IoU per class and mIoU
+            results: Dictionary with IoU per camera, class and mIoU
         """
-        table = prettytable.PrettyTable([' ', *self.class_names, 'mean'])
-        table.add_row(
-            ['IoU', *[f"{results[name]:.4f}" for name in self.class_names], f"{results['mIoU']:.4f}"]
-        )
-        
         print("\n" + "="*80)
         print("mIoU EVALUATION RESULTS")
         print("="*80)
-        print(table)
-        print(f"\nmIoU = {results['mIoU']:.4f}")
+        
+        # Print average first if multiple cameras
+        if 'AVERAGE' in results:
+            camera_results = results['AVERAGE']
+            table = prettytable.PrettyTable([' ', *self.class_names, 'mean'])
+            table.add_row(
+                ['IoU', *[f"{camera_results[name]:.4f}" for name in self.class_names], 
+                 f"{camera_results['mIoU']:.4f}"]
+            )
+            print(f"\nAVERAGE (across {len(self.camera_names)} cameras):")
+            print(table)
+            print(f"mIoU = {camera_results['mIoU']:.4f}")
+            print("-"*80)
+        
+        # Print per-camera results
+        for camera_name in self.camera_names:
+            if camera_name in results:
+                camera_results = results[camera_name]
+                table = prettytable.PrettyTable([' ', *self.class_names, 'mean'])
+                table.add_row(
+                    ['IoU', *[f"{camera_results[name]:.4f}" for name in self.class_names],
+                     f"{camera_results['mIoU']:.4f}"]
+                )
+                print(f"\n{camera_name}:")
+                print(table)
+                print(f"mIoU = {camera_results['mIoU']:.4f}")
+        
         print("="*80)
 
 
@@ -749,6 +859,11 @@ Examples:
     # Control flow
     parser.add_argument('--skip-inference', action='store_true',
                        help='Skip inference step (use existing predictions)')
+    parser.add_argument('--apply-clipping', action='store_true',
+                       help='Apply camera FOV clipping (default: True)')
+    parser.add_argument('--no-clipping', dest='apply_clipping', action='store_false',
+                       help='Disable FOV clipping (full BEV evaluation)')
+    parser.set_defaults(apply_clipping=True)
     
     args = parser.parse_args()
     
@@ -771,6 +886,7 @@ Examples:
     print(f"  Checkpoint: {args.checkpoint}")
     print(f"  Camera configuration: {camera_names} ({len(camera_names)}/6 cameras)")
     print(f"  Evaluation method: mIoU (rasterized semantic segmentation)")
+    print(f"  FOV clipping: {'ENABLED' if args.apply_clipping else 'DISABLED (full BEV)'}")
     print(f"  Canvas size: {args.canvas_size}")
     print(f"  Line width: {args.line_width}m")
     print(f"  Predictions file: {args.predictions_pkl}")
@@ -839,9 +955,12 @@ Examples:
     
     # Create evaluator
     evaluator = RasterMapEvaluator(
+        nuscenes_data_path=nuscenes_eval_path,
         pc_range=args.pc_range,
         canvas_size=tuple(args.canvas_size),
-        line_width=args.line_width
+        line_width=args.line_width,
+        camera_names=camera_names,
+        apply_clipping=args.apply_clipping
     )
     
     # Accumulate predictions and GT
@@ -863,29 +982,35 @@ Examples:
         
         # Debug first sample
         if idx == 0 and args.visualize:
-            gt_vectors, gt_labels = evaluator.load_gt_vectors(sample_info, nuscenes_eval_path)
-            evaluator.debug_sample_vectors(
-                sample_token, gt_vectors, gt_labels,
-                pred_vectors, pred_labels
-            )
+            for camera_name in camera_names:
+                gt_vectors, gt_labels = evaluator.load_gt_vectors(sample_info, camera_name)
+                pred_vectors_proc, pred_labels_proc, pred_scores_proc = \
+                    evaluator.process_predictions_with_fov(
+                        pred_vectors, pred_labels, pred_scores,
+                        sample_info, camera_name
+                    )
+                evaluator.debug_sample_vectors(
+                    sample_token, gt_vectors, gt_labels,
+                    pred_vectors_proc, pred_labels_proc
+                )
+                break  # Only debug for first camera
         
         evaluator.accumulate_sample(
             sample_token=sample_token,
             sample_info=sample_info,
             pred_vectors=pred_vectors,
             pred_labels=pred_labels,
-            pred_scores=pred_scores,
-            nuscenes_path=nuscenes_eval_path
+            pred_scores=pred_scores
         )
         
         # Generate visualizations for first N samples
         if args.visualize and vis_count < args.vis_samples:
-            evaluator.visualize_sample(
-                sample_token=sample_token,
-                output_dir=args.vis_output_dir,
-                pred_vectors=pred_vectors,
-                pred_labels=pred_labels
-            )
+            for camera_name in camera_names:
+                evaluator.visualize_sample(
+                    sample_token=sample_token,
+                    output_dir=os.path.join(args.vis_output_dir, f"sample_{vis_count:03d}_{camera_name}"),
+                    camera_name=camera_name
+                )
             vis_count += 1
     
     # Compute metrics
