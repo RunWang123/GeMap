@@ -57,6 +57,8 @@ from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
 from shapely.geometry import LineString, Point, box as shapely_box
 from shapely.affinity import affine_transform, rotate
 import cv2
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 # Add GeMap project path
 project_root = Path(__file__).parent.parent
@@ -411,6 +413,114 @@ class RasterMapEvaluator:
         
         return canvas
     
+    def visualize_sample(
+        self,
+        sample_token: str,
+        output_dir: str,
+        pred_vectors: np.ndarray = None,
+        pred_labels: np.ndarray = None
+    ):
+        """
+        Visualize GT and predictions for a sample.
+        
+        Args:
+            sample_token: Sample token
+            output_dir: Directory to save visualization
+            pred_vectors: Predicted vectors (optional)
+            pred_labels: Predicted labels (optional)
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Get GT and pred masks
+        gt_mask = self.gt_masks.get(sample_token)
+        pred_mask = self.pred_masks.get(sample_token)
+        
+        if gt_mask is None:
+            print(f"Warning: No GT for sample {sample_token}")
+            return
+        
+        # Create figure
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+        fig.suptitle(f'Sample: {sample_token}', fontsize=16)
+        
+        class_colors = ['red', 'green', 'blue']
+        
+        # Row 1: Ground Truth
+        for class_id, class_name in enumerate(self.class_names):
+            ax = axes[0, class_id]
+            ax.imshow(gt_mask[class_id], cmap='gray', vmin=0, vmax=1)
+            ax.set_title(f'GT: {class_name}')
+            ax.axis('off')
+        
+        # GT combined
+        ax = axes[0, 3]
+        gt_combined = np.zeros((self.canvas_size[1], self.canvas_size[0], 3), dtype=np.uint8)
+        for class_id in range(self.num_classes):
+            color = np.array(plt.cm.colors.to_rgb(class_colors[class_id])) * 255
+            gt_combined[gt_mask[class_id]] = color.astype(np.uint8)
+        ax.imshow(gt_combined)
+        ax.set_title('GT: All Classes')
+        ax.axis('off')
+        
+        # Row 2: Predictions
+        if pred_mask is not None:
+            for class_id, class_name in enumerate(self.class_names):
+                ax = axes[1, class_id]
+                ax.imshow(pred_mask[class_id], cmap='gray', vmin=0, vmax=1)
+                ax.set_title(f'Pred: {class_name}')
+                ax.axis('off')
+            
+            # Pred combined
+            ax = axes[1, 3]
+            pred_combined = np.zeros((self.canvas_size[1], self.canvas_size[0], 3), dtype=np.uint8)
+            for class_id in range(self.num_classes):
+                color = np.array(plt.cm.colors.to_rgb(class_colors[class_id])) * 255
+                pred_combined[pred_mask[class_id]] = color.astype(np.uint8)
+            ax.imshow(pred_combined)
+            ax.set_title('Pred: All Classes')
+            ax.axis('off')
+        else:
+            for ax in axes[1, :]:
+                ax.text(0.5, 0.5, 'No predictions', ha='center', va='center', transform=ax.transAxes)
+                ax.axis('off')
+        
+        # Add legend
+        legend_elements = [
+            mpatches.Patch(color=class_colors[i], label=self.class_names[i])
+            for i in range(self.num_classes)
+        ]
+        fig.legend(handles=legend_elements, loc='lower center', ncol=3, fontsize=12)
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'{sample_token}.png')
+        plt.savefig(output_path, dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        
+        print(f"  Saved visualization: {output_path}")
+    
+    def debug_sample_vectors(
+        self,
+        sample_token: str,
+        gt_vectors: np.ndarray,
+        gt_labels: np.ndarray,
+        pred_vectors: np.ndarray,
+        pred_labels: np.ndarray
+    ):
+        """
+        Print debug information about vectors for a sample.
+        """
+        print(f"\nDEBUG - Sample: {sample_token}")
+        print(f"  GT vectors: {len(gt_vectors)}, labels: {gt_labels}")
+        if len(gt_vectors) > 0:
+            print(f"    GT vector shapes: {[v.shape for v in gt_vectors[:3]]}")
+            print(f"    GT vector ranges: X=[{gt_vectors[0][:, 0].min():.2f}, {gt_vectors[0][:, 0].max():.2f}], Y=[{gt_vectors[0][:, 1].min():.2f}, {gt_vectors[0][:, 1].max():.2f}]")
+        print(f"  Pred vectors: {len(pred_vectors)}, labels: {pred_labels}")
+        if len(pred_vectors) > 0:
+            print(f"    Pred vector shapes: {[v.shape for v in pred_vectors[:3]]}")
+            print(f"    Pred vector ranges: X=[{pred_vectors[0][:, 0].min():.2f}, {pred_vectors[0][:, 0].max():.2f}], Y=[{pred_vectors[0][:, 1].min():.2f}, {pred_vectors[0][:, 1].max():.2f}]")
+    
     def load_gt_vectors(self, sample_info: Dict) -> Tuple[np.ndarray, np.ndarray]:
         """
         Load ground truth vectors from NuScenes for a sample.
@@ -525,6 +635,20 @@ class RasterMapEvaluator:
             Dictionary with IoU per class and mIoU
         """
         print(f"\nEvaluating on {len(self.gt_masks)} samples...")
+        
+        # Print statistics before computing IoU
+        total_gt_pixels = 0
+        total_pred_pixels = 0
+        for token in self.gt_masks.keys():
+            if token in self.pred_masks:
+                gt_mask = self.gt_masks[token]
+                pred_mask = self.pred_masks[token]
+                total_gt_pixels += gt_mask.sum()
+                total_pred_pixels += pred_mask.sum()
+        
+        print(f"  Total GT pixels: {total_gt_pixels}")
+        print(f"  Total Pred pixels: {total_pred_pixels}")
+        
         results = self.compute_iou_per_class()
         return results
     
@@ -604,6 +728,14 @@ Examples:
     parser.add_argument('--output-json', type=str, default=None,
                        help='Output JSON file for results')
     
+    # Visualization arguments
+    parser.add_argument('--visualize', action='store_true',
+                       help='Generate visualizations of rasterized maps')
+    parser.add_argument('--vis-samples', type=int, default=5,
+                       help='Number of samples to visualize (default: 5)')
+    parser.add_argument('--vis-output-dir', type=str, default='vis_miou',
+                       help='Output directory for visualizations')
+    
     # Control flow
     parser.add_argument('--skip-inference', action='store_true',
                        help='Skip inference step (use existing predictions)')
@@ -633,6 +765,10 @@ Examples:
     print(f"  Line width: {args.line_width}m")
     print(f"  Predictions file: {args.predictions_pkl}")
     print(f"  Output file: {args.output_json}")
+    if args.visualize:
+        print(f"  Visualization: ENABLED ({args.vis_samples} samples -> {args.vis_output_dir}/)")
+    else:
+        print(f"  Visualization: DISABLED (use --visualize to enable)")
     
     # STEP 1: Run inference (unless skipped)
     if not args.skip_inference:
@@ -691,7 +827,8 @@ Examples:
     
     # Accumulate predictions and GT
     print(f"\nProcessing {len(samples)} samples...")
-    for sample_info in tqdm(samples, desc="Rasterizing"):
+    vis_count = 0
+    for idx, sample_info in enumerate(tqdm(samples, desc="Rasterizing")):
         sample_token = sample_info['token']
         
         if sample_token not in predictions_by_token:
@@ -705,6 +842,14 @@ Examples:
             pred_labels = pred_data['labels']
             pred_scores = pred_data['scores']
         
+        # Debug first sample
+        if idx == 0 and args.visualize:
+            gt_vectors, gt_labels = evaluator.load_gt_vectors(sample_info)
+            evaluator.debug_sample_vectors(
+                sample_token, gt_vectors, gt_labels,
+                pred_vectors, pred_labels
+            )
+        
         evaluator.accumulate_sample(
             sample_token=sample_token,
             sample_info=sample_info,
@@ -712,6 +857,16 @@ Examples:
             pred_labels=pred_labels,
             pred_scores=pred_scores
         )
+        
+        # Generate visualizations for first N samples
+        if args.visualize and vis_count < args.vis_samples:
+            evaluator.visualize_sample(
+                sample_token=sample_token,
+                output_dir=args.vis_output_dir,
+                pred_vectors=pred_vectors,
+                pred_labels=pred_labels
+            )
+            vis_count += 1
     
     # Compute metrics
     results = evaluator.evaluate()
