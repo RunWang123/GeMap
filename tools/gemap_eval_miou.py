@@ -54,7 +54,6 @@ import os.path as osp
 
 # NuScenes and geometry utilities
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
-from nuscenes import NuScenes
 from shapely.geometry import LineString, Point, box as shapely_box
 from shapely.affinity import affine_transform, rotate
 import cv2
@@ -293,7 +292,6 @@ class RasterMapEvaluator:
     Based on StreamMapNet's raster_eval.py approach.
     
     Args:
-        nuscenes_data_path: Path to NuScenes dataset
         pc_range: Point cloud range [x_min, y_min, z_min, x_max, y_max, z_max]
         canvas_size: Size of rasterized map (width, height) in pixels
         line_width: Width of rendered lines in meters (for rasterization)
@@ -302,13 +300,11 @@ class RasterMapEvaluator:
     
     def __init__(
         self,
-        nuscenes_data_path: str,
         pc_range: List[float] = [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0],
         canvas_size: Tuple[int, int] = (200, 400),  # (width, height) in pixels
         line_width: float = 2.0,  # meters
         class_names: List[str] = ['divider', 'ped_crossing', 'boundary']
     ):
-        self.nuscenes = NuScenes(version='v1.0-trainval', dataroot=nuscenes_data_path, verbose=False)
         self.pc_range = pc_range
         self.canvas_size = canvas_size  # (width, height)
         self.line_width = line_width
@@ -686,16 +682,8 @@ Examples:
     print("STEP 3: Rasterizing and Computing mIoU")
     print("="*80)
     
-    # Get actual NuScenes path
-    if args.nuscenes_path:
-        nuscenes_eval_path = args.nuscenes_path
-    else:
-        cfg = Config.fromfile(args.config)
-        nuscenes_eval_path = cfg.data.test.data_root
-    
     # Create evaluator
     evaluator = RasterMapEvaluator(
-        nuscenes_data_path=nuscenes_eval_path,
         pc_range=args.pc_range,
         canvas_size=tuple(args.canvas_size),
         line_width=args.line_width
