@@ -521,30 +521,38 @@ class RasterMapEvaluator:
             print(f"    Pred vector shapes: {[v.shape for v in pred_vectors[:3]]}")
             print(f"    Pred vector ranges: X=[{pred_vectors[0][:, 0].min():.2f}, {pred_vectors[0][:, 0].max():.2f}], Y=[{pred_vectors[0][:, 1].min():.2f}, {pred_vectors[0][:, 1].max():.2f}]")
     
-    def load_gt_vectors(self, sample_info: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    def load_gt_vectors(
+        self, 
+        sample_info: Dict, 
+        nuscenes_path: str,
+        fixed_num: int = 20
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Load ground truth vectors from NuScenes for a sample.
+        Uses EXACT same extraction method as visualization script.
         
         Args:
             sample_info: Sample information dictionary
+            nuscenes_path: Path to NuScenes dataset
+            fixed_num: Number of points to resample to (default: 20)
         
         Returns:
             gt_vectors: [N, num_pts, 2] array
             gt_labels: [N] array
         """
-        # Extract from sample_info (same as GeMap loading)
-        gt_vectors = []
-        gt_labels = []
+        # Import shared utilities
+        from camera_fov_utils import extract_gt_vectors
         
-        # Assuming sample_info has 'vectors' and 'labels' keys
-        # This follows the MapTR/GeMap dataset format
-        if 'vectors' in sample_info:
-            vectors_data = sample_info['vectors']
-            for class_id, class_vectors in enumerate(vectors_data):
-                for vector in class_vectors:
-                    if len(vector) > 0:
-                        gt_vectors.append(vector)
-                        gt_labels.append(class_id)
+        # Extract GT using same method as visualization
+        gt_data = extract_gt_vectors(
+            sample_info=sample_info,
+            nuscenes_path=nuscenes_path,
+            pc_range=self.pc_range,
+            fixed_num=fixed_num
+        )
+        
+        gt_vectors = gt_data['vectors']  # List of numpy arrays
+        gt_labels = gt_data['labels']    # List of ints
         
         if len(gt_vectors) == 0:
             return np.zeros((0, 2, 2)), np.zeros((0,), dtype=np.int64)
@@ -561,7 +569,8 @@ class RasterMapEvaluator:
         sample_info: Dict,
         pred_vectors: np.ndarray,
         pred_labels: np.ndarray,
-        pred_scores: np.ndarray = None
+        pred_scores: np.ndarray = None,
+        nuscenes_path: str = None
     ):
         """
         Rasterize and accumulate a single sample.
@@ -572,13 +581,14 @@ class RasterMapEvaluator:
             pred_vectors: [N, num_pts, 2] predicted vectors
             pred_labels: [N] predicted labels
             pred_scores: [N] prediction scores (optional, for thresholding)
+            nuscenes_path: Path to NuScenes dataset (required for GT extraction)
         """
         # Rasterize predictions
         pred_mask = self.rasterize_sample(pred_vectors, pred_labels)
         self.pred_masks[sample_token] = pred_mask
         
         # Load and rasterize ground truth
-        gt_vectors, gt_labels = self.load_gt_vectors(sample_info)
+        gt_vectors, gt_labels = self.load_gt_vectors(sample_info, nuscenes_path)
         gt_mask = self.rasterize_sample(gt_vectors, gt_labels)
         self.gt_masks[sample_token] = gt_mask
     
@@ -818,6 +828,15 @@ Examples:
     print("STEP 3: Rasterizing and Computing mIoU")
     print("="*80)
     
+    # Get actual NuScenes path for GT extraction
+    if args.nuscenes_path:
+        nuscenes_eval_path = args.nuscenes_path
+    else:
+        cfg = Config.fromfile(args.config)
+        nuscenes_eval_path = cfg.data.test.data_root
+    
+    print(f"Using NuScenes path for GT extraction: {nuscenes_eval_path}")
+    
     # Create evaluator
     evaluator = RasterMapEvaluator(
         pc_range=args.pc_range,
@@ -844,7 +863,7 @@ Examples:
         
         # Debug first sample
         if idx == 0 and args.visualize:
-            gt_vectors, gt_labels = evaluator.load_gt_vectors(sample_info)
+            gt_vectors, gt_labels = evaluator.load_gt_vectors(sample_info, nuscenes_eval_path)
             evaluator.debug_sample_vectors(
                 sample_token, gt_vectors, gt_labels,
                 pred_vectors, pred_labels
@@ -855,7 +874,8 @@ Examples:
             sample_info=sample_info,
             pred_vectors=pred_vectors,
             pred_labels=pred_labels,
-            pred_scores=pred_scores
+            pred_scores=pred_scores,
+            nuscenes_path=nuscenes_eval_path
         )
         
         # Generate visualizations for first N samples
