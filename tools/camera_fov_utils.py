@@ -307,13 +307,17 @@ class CameraFOVClipper:
         
         # Find intersection with actual ground plane (z = -lidar_height_above_ground in BEV coordinates)
         ground_plane_z = -lidar_height_above_ground
+        # Check if ray is nearly parallel to ground
         if abs(ray_dir_world[2]) < 1e-6:
-            return np.array([cam_pos_world[0], cam_pos_world[1]])
+            # Ray parallel to ground - project forward by max_range
+            use_distance = self.max_range if self.max_range is not None else 50.0
+            intersection = cam_pos_world + use_distance * ray_dir_world
+            return np.array([intersection[0], intersection[1]])
         
         t = (ground_plane_z - cam_pos_world[2]) / ray_dir_world[2]
         if t < 0:
-            # Use max_range if provided, otherwise default to 100.0
-            t = self.max_range if self.max_range is not None else 100.0
+            # Use max_range if provided, otherwise default to 50.0
+            t = self.max_range if self.max_range is not None else 50.0
         elif self.max_range is not None and t > self.max_range:
             # Clamp to max_range if provided
             t = self.max_range

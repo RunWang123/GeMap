@@ -61,10 +61,10 @@ except ImportError:
     print("Error: nuscenes-devkit not available. Please install it.")
     sys.exit(1)
 
-# Import FOV clipping utilities (from MapTR tools)
-maptr_tools_path = Path(__file__).resolve().parents[2] / 'MapTR' / 'tools'
-if str(maptr_tools_path) not in sys.path:
-    sys.path.insert(0, str(maptr_tools_path))
+# Import FOV clipping utilities (from local tools which we fixed)
+# maptr_tools_path = Path(__file__).resolve().parents[2] / 'MapTR' / 'tools'
+# if str(maptr_tools_path) not in sys.path:
+#     sys.path.insert(0, str(maptr_tools_path))
 
 from camera_fov_utils import CameraFOVClipper
 
@@ -485,8 +485,9 @@ def main():
     parser.add_argument('--nuscenes_path', type=str, required=True)
     parser.add_argument('--version', type=str, default='v1.0-mini',
                        choices=['v1.0-trainval', 'v1.0-test', 'v1.0-mini'])
-    parser.add_argument('--split', type=str, default='val', choices=['train', 'val', None],
-                       help='Filter scenes by split (train/val). Default is val. If None, process all scenes.')
+    parser.add_argument('--split', type=str, default='val', nargs='?', const='all',
+                       choices=['train', 'val', 'all', 'none', 'None'],
+                       help='Filter scenes by split (train/val). Default is val. If "all" (or flag without arg), process all scenes.')
     parser.add_argument('--scene_idx', type=int, help='Specific scene index')
     parser.add_argument('--num_scenes', type=int, help='Number of scenes to process')
     parser.add_argument('--output_dir', type=str, required=True)
@@ -514,7 +515,7 @@ def main():
     print(f"Loaded {len(nusc.scene)} scenes")
     
     # Filter scenes by split if specified
-    if args.split is not None:
+    if args.split is not None and args.split.lower() not in ['all', 'none']:
         # Load split from pickle files (same as gamma script uses)
         import pickle
         pkl_file = os.path.join(args.nuscenes_path, f'nuscenes_infos_temporal_{args.split}.pkl')
