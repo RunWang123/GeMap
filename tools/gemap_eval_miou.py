@@ -56,6 +56,10 @@ import os.path as osp
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
 from shapely.geometry import LineString, Point, box as shapely_box
 from shapely.affinity import affine_transform, rotate
+import cv2
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
 # Import shared camera FOV utilities
 from camera_fov_utils import (
     VectorizedLocalMap,
