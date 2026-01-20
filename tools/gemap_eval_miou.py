@@ -837,6 +837,8 @@ Examples:
     parser.add_argument('--samples-pkl', type=str,
                        default=None,
                        help='Path to samples pickle file (default: use path from config)')
+    parser.add_argument('--num-samples', type=int, default=None,
+                       help='Number of samples to evaluate (default: all samples)')
     parser.add_argument('--pc-range', type=float, nargs=6,
                        default=[-15.0, -30.0, -2.0, 15.0, 30.0, 2.0],
                        help='Point cloud range')
@@ -895,6 +897,8 @@ Examples:
     print(f"  Line width: {args.line_width}m")
     print(f"  Predictions file: {args.predictions_pkl}")
     print(f"  Output file: {args.output_json}")
+    if args.num_samples is not None:
+        print(f"  Num samples: {args.num_samples} (limited for testing)")
     if args.visualize:
         print(f"  Visualization: ENABLED ({args.vis_samples} samples -> {args.vis_output_dir}/)")
     else:
@@ -936,7 +940,14 @@ Examples:
     with open(samples_path, 'rb') as f:
         samples_data = pickle.load(f)
     samples = samples_data['infos']
-    print(f"✓ Loaded {len(samples)} samples")
+    total_samples = len(samples)
+    
+    # Limit samples if specified
+    if args.num_samples is not None:
+        samples = samples[:args.num_samples]
+        print(f"✓ Loaded {total_samples} samples, evaluating first {len(samples)}")
+    else:
+        print(f"✓ Loaded {len(samples)} samples")
     
     print(f"\nLoading predictions from {predictions_pkl}...")
     with open(predictions_pkl, 'rb') as f:
