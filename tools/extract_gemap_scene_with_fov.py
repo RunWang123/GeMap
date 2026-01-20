@@ -514,34 +514,43 @@ def main():
     nusc = NuScenes(version=args.version, dataroot=args.nuscenes_path, verbose=False)
     print(f"Loaded {len(nusc.scene)} scenes")
     
-    # Filter scenes by split if specified
+    # Load scene ordering from pickle file to match Sigma dataset ordering
+    import pickle
     if args.split is not None and args.split.lower() not in ['all', 'none']:
-        # Load split from pickle files (same as gamma script uses)
-        import pickle
         pkl_file = os.path.join(args.nuscenes_path, f'nuscenes_infos_temporal_{args.split}.pkl')
-        if os.path.exists(pkl_file):
-            print(f"Loading split from: {pkl_file}")
-            with open(pkl_file, 'rb') as f:
-                pkl_data = pickle.load(f)
-            # Extract scene tokens from pickle file
-            split_scene_tokens = set()
-            for sample_info in pkl_data['infos']:
-                split_scene_tokens.add(sample_info['scene_token'])
-            # Get indices of scenes in the requested split
-            filtered_indices = []
-            for i in range(len(nusc.scene)):
-                if nusc.scene[i]['token'] in split_scene_tokens:
-                    filtered_indices.append(i)
-            print(f"Filtered to {len(filtered_indices)} scenes in '{args.split}' split (from pickle file)")
-        else:
-            print(f"Warning: Pickle file not found: {pkl_file}")
-            print(f"Falling back to nuScenes official split")
-            from nuscenes.utils import splits
-            split_scenes = splits.create_splits_scenes()[args.split]
-            all_scene_names = [nusc.scene[i]['name'] for i in range(len(nusc.scene))]
-            filtered_indices = [i for i, name in enumerate(all_scene_names) if name in split_scenes]
-            print(f"Filtered to {len(filtered_indices)} scenes in '{args.split}' split")
     else:
+        # Default to val split for consistency with Sigma
+        pkl_file = os.path.join(args.nuscenes_path, 'nuscenes_infos_temporal_val.pkl')
+    
+    if os.path.exists(pkl_file):
+        print(f"Loading scene ordering from: {pkl_file}")
+        with open(pkl_file, 'rb') as f:
+            pkl_data = pickle.load(f)
+        
+        # Extract UNIQUE scene tokens in ORDER they appear in pickle file
+        # This matches how Sigma's NuScenesMapTRDataset builds dataset.samples
+        seen_scene_tokens = []
+        scene_token_to_nusc_idx = {}
+        
+        for sample_info in pkl_data['infos']:
+            scene_token = sample_info['scene_token']
+            if scene_token not in seen_scene_tokens:
+                seen_scene_tokens.append(scene_token)
+                # Find this scene's index in nusc.scene
+                for i, scene in enumerate(nusc.scene):
+                    if scene['token'] == scene_token:
+                        scene_token_to_nusc_idx[scene_token] = i
+                        break
+        
+        # Create filtered_indices using pickle file scene order
+        filtered_indices = [scene_token_to_nusc_idx[token] for token in seen_scene_tokens 
+                           if token in scene_token_to_nusc_idx]
+        
+        print(f"Using {len(filtered_indices)} scenes from pickle file (matches Sigma dataset ordering)")
+        print(f"First 5 scene indices: {filtered_indices[:5]}")
+    else:
+        print(f"Warning: Pickle file not found: {pkl_file}")
+        print(f"Falling back to nuScenes scene order (may not match Sigma!)")
         filtered_indices = list(range(len(nusc.scene)))
     
     # Determine scenes to process
@@ -554,9 +563,9 @@ def main():
         print(f"Processing all {len(scene_indices)} scenes")
     
     # Process each scene
-    for local_idx, scene_idx in enumerate(scene_indices):
+    for dataset_idx, scene_idx in enumerate(scene_indices):
         print(f"\n{'='*80}")
-        print(f"Processing scene {local_idx}/{len(scene_indices)-1} (global idx: {scene_idx})")
+        print(f"Processing dataset index {dataset_idx} (nusc.scene[{scene_idx}])")
         print(f"{'='*80}")
         
         # Run inference with FOV clipping
@@ -574,10 +583,11 @@ def main():
             print(f"  Skipping scene {scene_idx} - no predictions after FOV clipping")
             continue
         
-        # Create scene output directory (use local index for sequential numbering)
+        # Create scene output directory (use dataset_idx to match Sigma naming)
+        # This ensures scene_0000, scene_0001, etc. match the pickle file order
         scene_name = pred_data['scene_name']
         camera_suffix = '_'.join(camera_names)
-        scene_output_dir = output_dir / f"scene_{local_idx:04d}_{scene_name}_{camera_suffix}"
+        scene_output_dir = output_dir / f"scene_{dataset_idx:04d}_{scene_name}_{camera_suffix}"
         scene_output_dir.mkdir(exist_ok=True)
         
         # Save predictions
