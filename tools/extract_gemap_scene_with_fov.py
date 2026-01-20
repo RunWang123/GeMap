@@ -527,26 +527,43 @@ def main():
         with open(pkl_file, 'rb') as f:
             pkl_data = pickle.load(f)
         
-        # Extract UNIQUE scene tokens in ORDER they appear in pickle file
-        # This matches how Sigma's NuScenesMapTRDataset builds dataset.samples
-        seen_scene_tokens = []
+        # Group samples by scene_token (same as Sigma dataset)
+        scene_samples = {}
+        for info in pkl_data['infos']:
+            scene_token = info['scene_token']
+            if scene_token not in scene_samples:
+                scene_samples[scene_token] = []
+            scene_samples[scene_token].append(info)
+        
+        # Sort each scene's frames by timestamp
+        for scene_token in scene_samples:
+            scene_samples[scene_token].sort(key=lambda x: x['timestamp'])
+        
+        # Create scene list with first frame's timestamp for sorting
+        scene_list = []
+        for scene_token, frames in scene_samples.items():
+            scene_list.append({
+                'scene_token': scene_token,
+                'first_timestamp': frames[0]['timestamp']
+            })
+        
+        # CRITICAL: Sort by first frame's timestamp (matches Sigma dataset line 500)
+        scene_list.sort(key=lambda x: x['first_timestamp'])
+        
+        # Extract sorted scene tokens
+        sorted_scene_tokens = [s['scene_token'] for s in scene_list]
+        
+        # Map scene tokens to nusc.scene indices
         scene_token_to_nusc_idx = {}
+        for i, scene in enumerate(nusc.scene):
+            scene_token_to_nusc_idx[scene['token']] = i
         
-        for sample_info in pkl_data['infos']:
-            scene_token = sample_info['scene_token']
-            if scene_token not in seen_scene_tokens:
-                seen_scene_tokens.append(scene_token)
-                # Find this scene's index in nusc.scene
-                for i, scene in enumerate(nusc.scene):
-                    if scene['token'] == scene_token:
-                        scene_token_to_nusc_idx[scene_token] = i
-                        break
-        
-        # Create filtered_indices using pickle file scene order
-        filtered_indices = [scene_token_to_nusc_idx[token] for token in seen_scene_tokens 
+        # Create filtered_indices using timestamp-sorted scene order
+        filtered_indices = [scene_token_to_nusc_idx[token] for token in sorted_scene_tokens 
                            if token in scene_token_to_nusc_idx]
         
-        print(f"Using {len(filtered_indices)} scenes from pickle file (matches Sigma dataset ordering)")
+        print(f"Using {len(filtered_indices)} scenes sorted by timestamp (matches Sigma dataset ordering)")
+        print(f"First 5 scene tokens: {sorted_scene_tokens[:5]}")
         print(f"First 5 scene indices: {filtered_indices[:5]}")
     else:
         print(f"Warning: Pickle file not found: {pkl_file}")
