@@ -516,25 +516,58 @@ def main():
     
     # Load scene ordering from pickle file to match Sigma dataset ordering
     import pickle
-    if args.split is not None and args.split.lower() not in ['all', 'none']:
-        pkl_file = os.path.join(args.nuscenes_path, f'nuscenes_infos_temporal_{args.split}.pkl')
-    else:
-        # Default to val split for consistency with Sigma
-        pkl_file = os.path.join(args.nuscenes_path, 'nuscenes_infos_temporal_val.pkl')
     
-    if os.path.exists(pkl_file):
-        print(f"Loading scene ordering from: {pkl_file}")
-        with open(pkl_file, 'rb') as f:
-            pkl_data = pickle.load(f)
+    # Handle split argument
+    if args.split is not None and args.split.lower() in ['all', 'none']:
+        # Process all scenes - need to combine train + val or use all scenes
+        print(f"Processing ALL scenes (train + val combined)")
+        pkl_files = []
+        for split_name in ['train', 'val']:
+            pkl_path = os.path.join(args.nuscenes_path, f'nuscenes_infos_temporal_{split_name}.pkl')
+            if os.path.exists(pkl_path):
+                pkl_files.append(pkl_path)
         
-        # Group samples by scene_token (same as Sigma dataset)
-        scene_samples = {}
-        for info in pkl_data['infos']:
-            scene_token = info['scene_token']
-            if scene_token not in scene_samples:
-                scene_samples[scene_token] = []
-            scene_samples[scene_token].append(info)
+        if pkl_files:
+            # Load and combine all splits
+            all_scene_samples = {}
+            for pkl_file in pkl_files:
+                print(f"  Loading: {pkl_file}")
+                with open(pkl_file, 'rb') as f:
+                    pkl_data = pickle.load(f)
+                
+                for info in pkl_data['infos']:
+                    scene_token = info['scene_token']
+                    if scene_token not in all_scene_samples:
+                        all_scene_samples[scene_token] = []
+                    all_scene_samples[scene_token].append(info)
+            
+            scene_samples = all_scene_samples
+        else:
+            # No pickle files - use all scenes from nuScenes
+            print(f"  No pickle files found, using all {len(nusc.scene)} scenes")
+            scene_samples = None
+    else:
+        # Process specific split (train or val)
+        pkl_file = os.path.join(args.nuscenes_path, f'nuscenes_infos_temporal_{args.split}.pkl')
         
+        if os.path.exists(pkl_file):
+            print(f"Loading scene ordering from: {pkl_file}")
+            with open(pkl_file, 'rb') as f:
+                pkl_data = pickle.load(f)
+            
+            # Group samples by scene_token
+            scene_samples = {}
+            for info in pkl_data['infos']:
+                scene_token = info['scene_token']
+                if scene_token not in scene_samples:
+                    scene_samples[scene_token] = []
+                scene_samples[scene_token].append(info)
+        else:
+            print(f"Warning: Pickle file not found: {pkl_file}")
+            scene_samples = None
+    
+    # Build filtered_indices from scene_samples
+    if scene_samples is not None:
         # Sort each scene's frames by timestamp
         for scene_token in scene_samples:
             scene_samples[scene_token].sort(key=lambda x: x['timestamp'])
@@ -566,7 +599,6 @@ def main():
         print(f"First 5 scene tokens: {sorted_scene_tokens[:5]}")
         print(f"First 5 scene indices: {filtered_indices[:5]}")
     else:
-        print(f"Warning: Pickle file not found: {pkl_file}")
         print(f"Falling back to nuScenes scene order (may not match Sigma!)")
         filtered_indices = list(range(len(nusc.scene)))
     
