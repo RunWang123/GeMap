@@ -47,6 +47,8 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 # Add GeMap project path
 project_root = Path(__file__).parent.parent
@@ -533,6 +535,144 @@ def run_gemap_inference(
     return output_pkl
 
 
+# ==================== PARALLEL GEOMETRY BUFFERING WORKER ====================
+def buffer_geometries_worker(pred_vectors: np.ndarray, gt_vectors: np.ndarray, linewidth: float = 2.0):
+    """
+    Worker function to buffer geometries for one sample in parallel.
+    Returns buffered shapely geometries for predictions and GT.
+    """
+    from shapely.geometry import LineString
+    from shapely.geometry import CAP_STYLE, JOIN_STYLE
+    
+    def buffer_vectors(vectors):
+        if len(vectors) == 0:
+            return []
+        geometries = []
+        for vec in vectors:
+            if len(vec) >= 2:
+                line = LineString(vec)
+                buffered = line.buffer(linewidth, cap_style=CAP_STYLE.flat, join_style=JOIN_STYLE.mitre)
+                geometries.append(buffered)
+            else:
+                geometries.append(None)
+        return geometries
+    
+    pred_geoms = buffer_vectors(pred_vectors)
+    gt_geoms = buffer_vectors(gt_vectors)
+    
+    return pred_geoms, gt_geoms
+
+
+# ==================== PARALLEL PROCESSING WORKER ====================
+def process_sample_worker(
+    sample_info: Dict,
+    pred_data: Dict,
+    nuscenes_data_path: str,
+    pc_range: List[float],
+    num_sample_pts: int,
+    camera_names: List[str],
+    apply_clipping: bool
+) -> Dict:
+    """
+    Worker function to process a single sample in parallel.
+    Returns processed GT and predictions for all cameras.
+    
+    This function is picklable and can be used with multiprocessing.Pool
+    """
+    from camera_fov_utils import extract_gt_with_fov_clipping, process_predictions_with_fov_clipping
+    from shapely.geometry import LineString
+    
+    def resample_vector(vector: np.ndarray, num_sample: int) -> np.ndarray:
+        """Resample vector to fixed number of points"""
+        if len(vector) < 2:
+            if num_sample > len(vector):
+                padding = np.zeros((num_sample - len(vector), 2))
+                return np.vstack([vector, padding])
+            return vector
+        
+        line = LineString(vector)
+        distances = np.linspace(0, line.length, num_sample)
+        sampled_points = np.array([list(line.interpolate(distance).coords) 
+                                   for distance in distances]).reshape(-1, 2)
+        return sampled_points
+    
+    results_per_camera = {}
+    
+    for camera_name in camera_names:
+        # Process GT
+        gt_data = extract_gt_with_fov_clipping(
+            sample_info=sample_info,
+            nuscenes_path=nuscenes_data_path,
+            pc_range=pc_range,
+            camera_name=camera_name,
+            fixed_num=20,
+            apply_clipping=apply_clipping
+        )
+        
+        gt_vectors = gt_data['vectors']
+        gt_labels = gt_data['labels']
+        
+        # Resample GT to num_sample_pts
+        if len(gt_vectors) > 0:
+            final_gt_vectors = []
+            for vector in gt_vectors:
+                if len(vector) >= 2:
+                    resampled_vec = resample_vector(vector, num_sample_pts)
+                    final_gt_vectors.append(resampled_vec)
+            gt_vectors_array = np.array(final_gt_vectors) if final_gt_vectors else np.array([])
+            gt_labels_array = np.array(gt_labels) if final_gt_vectors else np.array([])
+        else:
+            gt_vectors_array = np.array([])
+            gt_labels_array = np.array([])
+        
+        # Process predictions
+        pred_vectors_processed, pred_labels_processed, pred_scores_processed = \
+            process_predictions_with_fov_clipping(
+                pred_vectors=pred_data['vectors'],
+                pred_labels=pred_data['labels'],
+                pred_scores=pred_data['scores'],
+                sample_info=sample_info,
+                nuscenes_path=nuscenes_data_path,
+                pc_range=pc_range,
+                camera_name=camera_name,
+                apply_clipping=apply_clipping
+            )
+        
+        # Resample predictions to num_sample_pts
+        if len(pred_vectors_processed) > 0:
+            final_pred_vectors = []
+            final_pred_labels = []
+            final_pred_scores = []
+            for vec, label, score in zip(pred_vectors_processed, pred_labels_processed, pred_scores_processed):
+                if len(vec) >= 2:
+                    resampled_vec = resample_vector(vec, num_sample_pts)
+                    final_pred_vectors.append(resampled_vec)
+                    final_pred_labels.append(label)
+                    final_pred_scores.append(score)
+            
+            pred_vectors_array = np.array(final_pred_vectors) if final_pred_vectors else np.array([])
+            pred_labels_array = np.array(final_pred_labels) if final_pred_labels else np.array([])
+            pred_scores_array = np.array(final_pred_scores) if final_pred_labels else np.array([])
+        else:
+            pred_vectors_array = np.array([])
+            pred_labels_array = np.array([])
+            pred_scores_array = np.array([])
+        
+        results_per_camera[camera_name] = {
+            'gt': {
+                'vectors': gt_vectors_array,
+                'labels': gt_labels_array
+            },
+            'pred': {
+                'vectors': pred_vectors_array,
+                'labels': pred_labels_array,
+                'scores': pred_scores_array
+            }
+        }
+    
+    return results_per_camera
+
+
 # ==================== EVALUATION CODE (EXACT COPY FROM evaluate_with_fov_clipping_standalone.py) ====================
 class CameraSpecificEvaluator:
     """
@@ -549,7 +689,8 @@ class CameraSpecificEvaluator:
         pc_range: List[float] = None,
         num_sample_pts: int = 100,
         thresholds_chamfer: List[float] = None,
-        camera_names: List[str] = None
+        camera_names: List[str] = None,
+        num_workers: int = 1
     ):
         """
         Args:
@@ -564,6 +705,7 @@ class CameraSpecificEvaluator:
         self.num_sample_pts: int = num_sample_pts
         self.thresholds_chamfer = thresholds_chamfer or [0.5, 1.0, 1.5]
         self.camera_names = camera_names or ['CAM_FRONT']
+        self.num_workers = num_workers # NEW: Store num_workers
         
         # Calculate patch size from pc_range
         self.patch_size = (self.pc_range[4] - self.pc_range[1], self.pc_range[3] - self.pc_range[0])
@@ -677,10 +819,14 @@ class CameraSpecificEvaluator:
     def compute_chamfer_distance_matrix_maptr_official(self,
                                                         pred_vectors: np.ndarray,
                                                         gt_vectors: np.ndarray,
-                                                        linewidth: float = 2.0) -> np.ndarray:
+                                                        linewidth: float = 2.0,
+                                                        pred_geometries: List = None,
+                                                        gt_geometries: List = None) -> np.ndarray:
         """
         Compute Chamfer Distance matrix using EXACT MapTR official method.
         EXACT copy from MapTR's tpfp_chamfer.py:custom_polyline_score()
+        
+        OPTIMIZED: Accepts pre-computed geometries to avoid redundant buffering.
         
         Returns NEGATIVE CD values (higher = better match).
         """
@@ -690,17 +836,24 @@ class CameraSpecificEvaluator:
         if num_preds == 0 or num_gts == 0:
             return np.full((num_preds, num_gts), -100.0)
         
-        # Create buffered shapely geometries
-        pred_lines_shapely = [
-            LineString(pred_vectors[i]).buffer(
-                linewidth, cap_style=CAP_STYLE.flat, join_style=JOIN_STYLE.mitre)
-            for i in range(num_preds)
-        ]
-        gt_lines_shapely = [
-            LineString(gt_vectors[i]).buffer(
-                linewidth, cap_style=CAP_STYLE.flat, join_style=JOIN_STYLE.mitre)
-            for i in range(num_gts)
-        ]
+        # Use pre-computed geometries if provided, otherwise create them
+        if pred_geometries is None:
+            pred_lines_shapely = [
+                LineString(pred_vectors[i]).buffer(
+                    linewidth, cap_style=CAP_STYLE.flat, join_style=JOIN_STYLE.mitre)
+                for i in range(num_preds)
+            ]
+        else:
+            pred_lines_shapely = pred_geometries
+        
+        if gt_geometries is None:
+            gt_lines_shapely = [
+                LineString(gt_vectors[i]).buffer(
+                    linewidth, cap_style=CAP_STYLE.flat, join_style=JOIN_STYLE.mitre)
+                for i in range(num_gts)
+            ]
+        else:
+            gt_lines_shapely = gt_geometries
         
         # STRtree spatial indexing
         tree = STRtree(pred_lines_shapely)
@@ -737,6 +890,31 @@ class CameraSpecificEvaluator:
                         cd_matrix[pred_idx, i] = -(valid_ab + valid_ba) / 2.0
         
         return cd_matrix
+    
+    def precompute_shapely_geometries(self,
+                                     vectors: np.ndarray,
+                                     linewidth: float = 2.0) -> List:
+        """
+        Pre-compute buffered Shapely geometries for a set of vectors.
+        This is a performance optimization to avoid recomputing geometries
+        for each threshold evaluation.
+        
+        Args:
+            vectors: Array of shape (N, num_points, 2)
+            linewidth: Buffer width for LineString
+        
+        Returns:
+            List of buffered Shapely polygons
+        """
+        if len(vectors) == 0:
+            return []
+        
+        geometries = [
+            LineString(vectors[i]).buffer(
+                linewidth, cap_style=CAP_STYLE.flat, join_style=JOIN_STYLE.mitre)
+            for i in range(len(vectors))
+        ]
+        return geometries
     
     def compute_chamfer_distance_torch(self,
                                        pred_vectors: np.ndarray,
@@ -799,10 +977,14 @@ class CameraSpecificEvaluator:
                                                pred_vectors: np.ndarray,
                                                pred_scores: np.ndarray,
                                                gt_vectors: np.ndarray,
-                                               threshold: float) -> Tuple[np.ndarray, np.ndarray]:
+                                               threshold: float,
+                                               pred_geometries: List = None,
+                                               gt_geometries: List = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         Match predictions to GT using MapTR's EXACT OFFICIAL method.
         EXACT copy from MapTR's tpfp.py:custom_tpfp_gen()
+        
+        OPTIMIZED: Accepts pre-computed geometries to avoid redundant buffering.
         """
         num_preds = len(pred_vectors)
         num_gts = len(gt_vectors)
@@ -821,9 +1003,10 @@ class CameraSpecificEvaluator:
         if threshold > 0:
             threshold = -threshold
         
-        # Compute CD matrix
+        # Compute CD matrix (with optional pre-computed geometries)
         cd_matrix = self.compute_chamfer_distance_matrix_maptr_official(
-            pred_vectors, gt_vectors, linewidth=2.0)
+            pred_vectors, gt_vectors, linewidth=2.0,
+            pred_geometries=pred_geometries, gt_geometries=gt_geometries)
         
         # Find best matching GT for each prediction
         matrix_max = cd_matrix.max(axis=1)
@@ -870,9 +1053,16 @@ class CameraSpecificEvaluator:
                             pred_vectors_list: List[np.ndarray],
                             pred_scores_list: List[np.ndarray],
                             gt_vectors_list: List[np.ndarray],
-                            threshold: float) -> Tuple[float, float]:
+                            threshold: float,
+                            class_name: str = "",
+                            pred_geoms_list: List = None,
+                            gt_geoms_list: List = None) -> Tuple[float, float]:
         """
         Compute AP and average CD for a single class at given threshold.
+        
+        Args:
+            pred_geoms_list: Optional pre-computed prediction geometries (avoids redundant buffering)
+            gt_geoms_list: Optional pre-computed GT geometries (avoids redundant buffering)
         """
         num_gts = sum(len(gts) for gts in gt_vectors_list)
         
@@ -884,7 +1074,35 @@ class CameraSpecificEvaluator:
         all_scores = []
         chamfer_distances_per_sample = []
         
-        for pred_vecs, pred_scores, gt_vecs in zip(pred_vectors_list, pred_scores_list, gt_vectors_list):
+        # Use pre-computed geometries if provided, otherwise compute them
+        if pred_geoms_list is None or gt_geoms_list is None:
+            pred_geoms_list = []
+            gt_geoms_list = []
+            
+            desc = f"Pre-computing geometries ({class_name})" if class_name else "Pre-computing geometries"
+            for pred_vecs, gt_vecs in tqdm(zip(pred_vectors_list, gt_vectors_list), 
+                                           total=len(pred_vectors_list),
+                                           desc=desc,
+                                           leave=False,
+                                           disable=len(pred_vectors_list) < 100):
+                if len(pred_vecs) > 0:
+                    pred_geoms = self.precompute_shapely_geometries(pred_vecs, linewidth=2.0)
+                else:
+                    pred_geoms = []
+                
+                if len(gt_vecs) > 0:
+                    gt_geoms = self.precompute_shapely_geometries(gt_vecs, linewidth=2.0)
+                else:
+                    gt_geoms = []
+                
+                pred_geoms_list.append(pred_geoms)
+                gt_geoms_list.append(gt_geoms)
+        
+        # Match predictions using pre-computed geometries
+        iterator = zip(pred_vectors_list, pred_scores_list, gt_vectors_list, 
+                      pred_geoms_list, gt_geoms_list)
+        
+        for pred_vecs, pred_scores, gt_vecs, pred_geoms, gt_geoms in iterator:
             if len(pred_vecs) == 0:
                 continue
             
@@ -894,9 +1112,10 @@ class CameraSpecificEvaluator:
                 all_scores.append(pred_scores)
                 continue
             
-            # Match predictions to GT
+            # Match predictions to GT (using pre-computed geometries)
             tp, fp = self.match_predictions_to_gt_maptr_official(
-                pred_vecs, pred_scores, gt_vecs, threshold)
+                pred_vecs, pred_scores, gt_vecs, threshold,
+                pred_geometries=pred_geoms, gt_geometries=gt_geoms)
             
             all_tp.append(tp)
             all_fp.append(fp)
@@ -950,6 +1169,54 @@ class CameraSpecificEvaluator:
             camera_preds = self.predictions_per_camera[camera_name]
             camera_gts = self.ground_truths_per_camera[camera_name]
             
+            # PRE-COMPUTE GEOMETRIES ONCE PER CAMERA (not per class!)
+            # This avoids redundant buffering: 6 cameras × 3 classes × 3 thresholds = 54 runs
+            # Optimized to: 6 cameras = 6 runs (9x speedup!)
+            # NOW PARALLELIZED: Use multiprocessing for additional 8x speedup
+            print(f"Pre-computing geometries for {camera_name}...")
+            
+            # Prepare data for parallel buffering
+            buffer_tasks = [(pred_data['vectors'], gt_data['vectors']) 
+                           for pred_data, gt_data in zip(camera_preds, camera_gts)]
+            
+            # Use multiprocessing to buffer geometries in parallel
+            num_workers = self.num_workers  # Use configured num_workers
+            if num_workers > 1:
+                # Clamp to cpu_count() to avoid excessive overhead if user requests too many
+                num_workers = min(num_workers, cpu_count())
+            
+            if num_workers > 1:
+                print(f"  Using {num_workers} parallel workers for geometry buffering...")
+                with Pool(processes=num_workers) as pool:
+                    geom_results = list(tqdm(
+                        pool.starmap(buffer_geometries_worker, buffer_tasks),
+                        total=len(buffer_tasks),
+                        desc=f"Buffering geometries ({camera_name})",
+                        leave=False
+                    ))
+                all_pred_geoms = [r[0] for r in geom_results]
+                all_gt_geoms = [r[1] for r in geom_results]
+            else:
+                # Serial fallback
+                all_pred_geoms = []
+                all_gt_geoms = []
+                for pred_data, gt_data in tqdm(zip(camera_preds, camera_gts),
+                                              total=len(camera_preds),
+                                              desc=f"Buffering geometries ({camera_name})",
+                                              leave=False):
+                    if len(pred_data['vectors']) > 0:
+                        pred_geoms = self.precompute_shapely_geometries(pred_data['vectors'], linewidth=2.0)
+                    else:
+                        pred_geoms = []
+                    
+                    if len(gt_data['vectors']) > 0:
+                        gt_geoms = self.precompute_shapely_geometries(gt_data['vectors'], linewidth=2.0)
+                    else:
+                        gt_geoms = []
+                    
+                    all_pred_geoms.append(pred_geoms)
+                    all_gt_geoms.append(gt_geoms)
+            
             # Evaluate each class
             for class_id, class_name in enumerate(class_names):
                 class_results = {}
@@ -959,19 +1226,38 @@ class CameraSpecificEvaluator:
                 pred_scores_list = []
                 gt_vectors_list = []
                 
-                for pred_data, gt_data in zip(camera_preds, camera_gts):
+                # Also extract the corresponding pre-computed geometries for this class
+                pred_geoms_for_class = []
+                gt_geoms_for_class = []
+                
+                for pred_data, gt_data, pred_geoms, gt_geoms in zip(camera_preds, camera_gts, 
+                                                                     all_pred_geoms, all_gt_geoms):
                     pred_mask = pred_data['labels'] == class_id
                     gt_mask = gt_data['labels'] == class_id
                     
                     pred_vectors_list.append(pred_data['vectors'][pred_mask])
                     pred_scores_list.append(pred_data['scores'][pred_mask])
                     gt_vectors_list.append(gt_data['vectors'][gt_mask])
+                    
+                    # Extract geometries for this class using the same mask
+                    if len(pred_geoms) > 0:
+                        pred_geoms_for_class.append([pred_geoms[i] for i in range(len(pred_geoms)) if pred_mask[i]])
+                    else:
+                        pred_geoms_for_class.append([])
+                    
+                    if len(gt_geoms) > 0:
+                        gt_geoms_for_class.append([gt_geoms[i] for i in range(len(gt_geoms)) if gt_mask[i]])
+                    else:
+                        gt_geoms_for_class.append([])
                 
                 # Compute AP at each threshold
                 avg_cd = None
                 for threshold in self.thresholds_chamfer:
                     ap, cd = self.compute_ap_for_class(
-                        pred_vectors_list, pred_scores_list, gt_vectors_list, threshold)
+                        pred_vectors_list, pred_scores_list, gt_vectors_list, 
+                        threshold, class_name=class_name,
+                        pred_geoms_list=pred_geoms_for_class,
+                        gt_geoms_list=gt_geoms_for_class)
                     
                     class_results[f'AP@{threshold}m'] = ap
                     all_aps.append(ap)
@@ -1093,6 +1379,8 @@ Examples:
                        help='Apply camera FOV clipping (default: True)')
     parser.add_argument('--no-clipping', dest='apply_clipping', action='store_false',
                        help='Disable FOV clipping (full BEV evaluation)')
+    parser.add_argument('--num-workers', type=int, default=8,
+                       help=f'Number of parallel workers for evaluation (default: 8, set to 1 for serial, max: {cpu_count()})')
     parser.set_defaults(apply_clipping=True)
     
     args = parser.parse_args()
@@ -1197,7 +1485,8 @@ Examples:
         pc_range=args.pc_range,
         num_sample_pts=args.num_sample_pts,
         thresholds_chamfer=[0.5, 1.0, 1.5],
-        camera_names=camera_names
+        camera_names=camera_names,
+        num_workers=max(1, args.num_workers)  # Pass configured worker count
     )
     
     print(f"\nEvaluator configuration:")
@@ -1209,23 +1498,65 @@ Examples:
     
     # Accumulate predictions and GT
     mode_str = "camera-specific FOV clipping" if args.apply_clipping else "full BEV (no clipping)"
-    print(f"\nProcessing {len(samples)} samples with {mode_str}...")
     
-    for sample_info in tqdm(samples, desc="Processing samples"):
+    # Determine number of workers (default is 8)
+    num_workers = max(1, args.num_workers)  # At least 1 worker
+    
+    print(f"\nProcessing {len(samples)} samples with {mode_str}...")
+    print(f"Using {num_workers} parallel workers (CPU count: {cpu_count()})")
+    
+    # Prepare data for parallel processing
+    samples_with_preds = []
+    for sample_info in samples:
         sample_token = sample_info['token']
-        
-        if sample_token not in predictions_by_token:
-            continue
-        
-        pred_data = predictions_by_token[sample_token]
-        evaluator.accumulate_sample(
-            sample_info=sample_info,
-            pred_vectors=pred_data['vectors'],
-            pred_labels=pred_data['labels'],
-            pred_scores=pred_data['scores'],
+        if sample_token in predictions_by_token:
+            samples_with_preds.append((sample_info, predictions_by_token[sample_token]))
+    
+    print(f"Matched {len(samples_with_preds)} samples with predictions")
+    
+    if num_workers == 1:
+        # Serial processing (for debugging or when multiprocessing has issues)
+        print("Running in SERIAL mode...")
+        results_list = []
+        for sample_info, pred_data in tqdm(samples_with_preds, desc="Processing samples"):
+            result = process_sample_worker(
+                sample_info, pred_data, nuscenes_eval_path, args.pc_range,
+                args.num_sample_pts, camera_names, args.apply_clipping
+            )
+            results_list.append(result)
+    else:
+        # Parallel processing
+        print("Running in PARALLEL mode...")
+        worker_fn = partial(
+            process_sample_worker,
+            nuscenes_data_path=nuscenes_eval_path,
+            pc_range=args.pc_range,
+            num_sample_pts=args.num_sample_pts,
+            camera_names=camera_names,
             apply_clipping=args.apply_clipping
         )
+        
+        with Pool(processes=num_workers) as pool:
+            # Use imap for progress bar
+            results_list = list(tqdm(
+                pool.starmap(worker_fn, samples_with_preds),
+                total=len(samples_with_preds),
+                desc="Processing samples"
+            ))
     
+    # Merge results into evaluator
+    print("\nMerging results from parallel workers...")
+    for result in results_list:
+        for camera_name in camera_names:
+            camera_result = result[camera_name]
+            
+            # Only append if there was actual data for this camera in the sample
+            if camera_result['pred'] is not None:
+                evaluator.predictions_per_camera[camera_name].append(camera_result['pred'])
+            if camera_result['gt'] is not None:
+                evaluator.ground_truths_per_camera[camera_name].append(camera_result['gt'])
+        
+        evaluator.num_samples_processed += 1  
     # Compute metrics
     print("\nComputing metrics...")
     results = evaluator.evaluate()
